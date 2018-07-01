@@ -1,7 +1,5 @@
 #!/usr/bin/env python
 
-from gevent import monkey
-monkey.patch_all()
 from gevent import pywsgi
 
 import errno
@@ -15,21 +13,27 @@ from functools import wraps
 from hashlib import md5, sha1
 from time import time
 
-from flask import Flask, g, url_for, render_template, Markup, request, redirect, send_from_directory, escape, jsonify
-from flask_httpauth import HTTPDigestAuth, HTTPBasicAuth
+from flask import Flask, session, g, url_for, render_template, Markup, request, redirect, send_from_directory, escape, jsonify
 #from flask_session import Session
 
 from network import (
-    user_priv, CLIENT_FORGET_SEC, CLIENT_ID_MIN_REPORT_RATE,
+    user_priv, AUTHENTICATION_TYPE, CLIENT_FORGET_SEC, CLIENT_ID_MIN_REPORT_RATE,
     CLIENT_ID_REPORT_SECONDS, LOG_COMMAND_TMPL, LOG_IDENTIFY_TMPL,
     LOG_FORGET_TMPL, LOG_CONNECT_ALLOWED_TMPL, NO_PASSPHRASE,
     PRIVILEGE_LEVELS, PRIV_IDENTITY, PRIV_DESCRIPTION, PRIV_STATE_TOTALS,
     PRIV_FULL_READ, PRIV_SHUTDOWN, PRIV_FULL_CONTROL, CONNECT_DENIED_PRIV_TMPL)
 
-from OpenSSL import SSL, crypto
+from OpenSSL import crypto
 from werkzeug.utils import secure_filename
 
 comms_options = 'md5'
+
+if AUTHENTICATION_TYPE == 'Basic':
+    from flask_httpauth import HTTPBasicAuth
+    auth = HTTPBasicAuth()
+elif AUTHENTICATION_TYPE == 'Digest':
+    from flask_httpauth import HTTPDigestAuth
+    auth = HTTPDigestAuth(use_ha1_pw=True)
 
 app_server = None
 
@@ -47,50 +51,6 @@ class InvalidUsage(Exception):
         rv = dict(self.payload or ()) 
         rv['message'] = self.message
         return rv
-
-
-def _set_users():
-    users = { 
-            'cortex': 'lemon',
-            'anon': NO_PASSPHRASE
-        }   
-    for username in users:
-        if "SHA1" in comms_options:
-            # Note 'SHA1' not 'SHA'.
-            users[username] = sha1(users.get(username)).hexdigest()
-        else:
-            users[username] = md5(users.get(username)).hexdigest()
-    return users
-
-
-#auth = HTTPDigestAuth(use_ha1_pw=True)
-auth = HTTPBasicAuth()
-users = _set_users()
-
-#@auth.get_password
-#def get_pw(username):
-#    if username in users:
-#        return auth.generate_ha1(username,users.get(username))
-#        #return users.get(username)
-#    return None
-
-
-@auth.get_password
-def get_pw(username):
-    if username in users:
-       return users.get(username)
-    return None
-
-
-@auth.hash_password
-def hash_pw(password):
-    comms_options = 'md5'
-    if "SHA1" in comms_options:
-        # Note 'SHA1' not 'SHA'.
-        return sha1(password).hexdigest()
-    else:
-        return md5(password).hexdigest()
-
 
 
 
@@ -212,15 +172,67 @@ def create_app(schd_obj):
     app.config['JSONIFY_PRETTYPRINT_REGULAR'] = False
     
     ALLOWED_EXTENSIONS = set(['txt', 'pdf', 'png', 'jpg', 'jpeg', 'gif', 'gz'])
-    srv_d = '/home/sutherlanddw/projects/learn_flask/helloworld'
+    srv_d = '/home/sutherlanddw/projects/learn_flask/cylctest'
+
+
+    def _set_users():
+        users = { 
+                'cortex': 'lemon',
+                'anon': NO_PASSPHRASE
+            }   
+        if AUTHENTICATION_TYPE == 'Basic':
+            for username in users:
+                if "SHA1" in comms_options:
+                    # Note 'SHA1' not 'SHA'.
+                    users[username] = sha1(users.get(username)).hexdigest()
+                else:
+                    users[username] = md5(users.get(username)).hexdigest()
+        return users
+    
+    
+    users = _set_users()
+    
+    if AUTHENTICATION_TYPE == 'Basic':
+        @auth.get_password
+        def get_pw(username):
+            if username in users:
+                return users.get(username)
+            return None
+    
+        @auth.hash_password
+        def hash_pw(password):
+            comms_options = 'md5'
+            if "SHA1" in comms_options:
+                # Note 'SHA1' not 'SHA'.
+                return sha1(password).hexdigest()
+            else:
+                return md5(password).hexdigest()
+
+    elif AUTHENTICATION_TYPE == 'Digest':
+        @auth.get_password
+        def get_pw(username):
+            if username in users:
+                return auth.generate_ha1(username,users.get(username))
+                #return users.get(username)
+            return None
 
     # Load or create SSL private key for the suite.
     pkey_obj = _get_ssl_pem(srv_d)
     # Load or create SSL certificate for the suite.
     _get_ssl_cert(srv_d, pkey_obj)    
     
+    @app.errorhandler(InvalidUsage)
+    def handle_invalid_usage(error):
+        response = jsonify(error.to_dict())
+        response.status_code = error.status_code
+        return response
+
+    api_endpoints(app)
+    for vfunc in app.view_functions:
+        app.add_url_rule('/id/'+vfunc, vfunc, app.view_functions[vfunc])
+
     test_endpoints(app)
-    api_compilation(app)
+    #api_endpoints(app,url_prefix='/id')
 
     @app.after_request
     def after_request(response):
@@ -280,7 +292,8 @@ def start_app(app):
                     srv_start_msg = "Server started: http://%s:%s"
                 else:
                     app_server = pywsgi.WSGIServer((host, port), app,
-                        certfile=context[0], keyfile=context[1])
+                        certfile=context[0], keyfile=context[1])#,
+                        #ca_certs='/etc/pki/tls/certs/ca-bundle.crt', cert_reqs=ssl.CERT_REQUIRED)
                     srv_start_msg = "Server started: https://%s:%s"
 
                 app_server.start()
@@ -302,182 +315,187 @@ def get_port():
     if hasattr(app_server, "server_port"):
         return app_server.server_port
 
+# ** Client info and privilege checking
+def _get_client_info():
+    """Return information about the most recent cherrypy request, if any."""
+    if hasattr(request.authorization, 'username'):
+        auth_user = request.authorization.username
+    else:
+        auth_user = 'Unknown'
+    info = request.headers
+    origin_string = info.get("User-Agent", "") 
+    origin_props = {}
+    if origin_string:
+        try:
+            origin_props = dict(
+                [_.split("/", 1) for _ in origin_string.split()]
+            )
+        except ValueError:
+            pass
+    prog_name = origin_props.get("prog_name", "Unknown")
+    uuid = origin_props.get("uuid", uuid4())
+    host = info.get("Host", "Unknown")
+    if info.get("From") and "@" in info["From"]:
+        user = info["From"].split("@")[0]
+    else:
+        user = ("Unknown")
+    return auth_user, prog_name, user, host, uuid
+
+
+
+# Client sessions, 'time' is time of latest visit.
+# Some methods may store extra info to the client session dict.
+# {UUID: {'time': TIME, ...}, ...}
+clients = {}
+# Start of id requests measurement
+_id_start_time = time()
+# Number of client id requests
+_num_id_requests = 0
+
+
+
+
+def _access_priv_ok(required_privilege_level):
+    """Return True if a client is allowed access to info from server_obj.
+
+    The required privilege level is compared to the level granted to the
+    client by the connection validator (held in thread local storage).
+
+    """
+    try:
+        return _check_access_priv(required_privilege_level)
+    except InvalidUsage:
+        return False
+
+def _check_access_priv(required_privilege_level):
+    """Raise an exception if client privilege is insufficient for server_obj.
+
+    (See the documentation above for the boolean version of this function).
+
+    """
+    auth_user, prog_name, user, host, uuid = _get_client_info()
+    priv_level = _get_priv_level(auth_user)
+    if (PRIVILEGE_LEVELS.index(priv_level) <
+            PRIVILEGE_LEVELS.index(required_privilege_level)):
+        err = CONNECT_DENIED_PRIV_TMPL % (
+            priv_level, required_privilege_level,
+            user, host, prog_name, uuid)
+        #LOG.warning(err)
+        # Raise an exception to be sent back to the client.
+        raise InvalidUsage(err, status_code=403)
+    return True
+
+def _check_access_priv_and_report(required_privilege_level, command, log_info=True):
+    """Check access privilege and log requests with identifying info.
+
+    In debug mode log all requests including task messages. Otherwise log
+    all user commands, and just the first info command from each client.
+
+    Return:
+        dict: containing the client session
+
+    """
+    _check_access_priv(required_privilege_level)
+    auth_user, prog_name, user, host, uuid = _get_client_info()
+    priv_level = _get_priv_level(auth_user)
+    #print(LOG_CONNECT_ALLOWED_TMPL % (
+        #user, host, prog_name, priv_level, uuid))
+    if uuid not in clients and log_info:
+        #print(LOG_COMMAND_TMPL % (
+        #    command, user, host, prog_name, uuid))
+        pass
+    clients.setdefault(uuid, {})
+    clients[uuid]['time'] = time()
+    _housekeep()
+    return clients[uuid]
+
+
+def _get_priv_level(auth_user):
+    """Get the privilege level for this authenticated user."""
+    if auth_user in user_priv:
+        return user_priv.get(auth_user)
+    return 'identity'
+    #return self.schd.config.cfg['cylc']['authentication']['public']
+
+def _report_id_requests():
+    """Report the frequency of identification (scan) requests."""
+    _num_id_requests += 1
+    now = time()
+    interval = now - _id_start_time
+    if interval > CLIENT_ID_REPORT_SECONDS:
+        rate = float(_num_id_requests) / interval
+        log = None
+        if rate > CLIENT_ID_MIN_REPORT_RATE:
+            log = "warning"
+        
+        #print(LOG_IDENTIFY_TMPL % ( 
+        #        _num_id_requests, interval ))
+        _id_start_time = now 
+        _num_id_requests = 0 
+    uuid = _get_client_info()[4]
+    clients.setdefault(uuid, {}) 
+    clients[uuid]['time'] = now 
+    _housekeep()
+   
+
+def _housekeep():
+    """Forget inactive clients."""
+    for uuid, client_info in clients.copy().items():
+        if time() - client_info['time'] > CLIENT_FORGET_SEC:
+            try:
+                del clients[uuid]
+            except KeyError:
+                pass
+            print(LOG_FORGET_TMPL % uuid)
+
+
+def _literal_eval(key, value, default=None):
+    """Wrap ast.literal_eval if value is basestring.
+
+    On SyntaxError or ValueError, return default is default is not None.
+    Otherwise, raise HTTPError 400.
+    """
+    if isinstance(value, basestring):
+        try:
+            return ast.literal_eval(value)
+        except (SyntaxError, ValueError):
+            if default is not None:
+                return default
+            raise InvalidUsage(
+                'Bad argument value: %s=%s' % (key, value),400)
+    else:
+        return value
+
+def priv_check(privilege, log_info=True):
+    def priv_decorator(func):
+        @wraps(func)
+        def priv_wrapper(*args, **kwargs):
+            command = func.__name__
+            _check_access_priv_and_report(privilege, command, log_info)
+            return func(*args, **kwargs)
+        return priv_wrapper
+    return priv_decorator
+
+
 def test_endpoints(app):
     @app.route('/test_func')
     def new_function():
         return "Hello!"
 
-def api_compilation(app):
+
+def api_endpoints(app, url_prefix=None):
+    
+    if url_prefix is None or url_prefix == '/':
+        url_prefix = ''
+    elif isinstance(url_prefix, basestring):
+        if url_prefix[0] != '/':
+            url_prefix = '/' + url_prefix
 
     schd = app.config['SCHEDULER']
     suite = schd.suite
 
-    # Client sessions, 'time' is time of latest visit.
-    # Some methods may store extra info to the client session dict.
-    # {UUID: {'time': TIME, ...}, ...}
-    clients = {}
-    # Start of id requests measurement
-    _id_start_time = time()
-    # Number of client id requests
-    _num_id_requests = 0
-
-
-    @app.errorhandler(InvalidUsage)
-    def handle_invalid_usage(error):
-        response = jsonify(error.to_dict())
-        response.status_code = error.status_code
-        return response
-
-    # ** Client info and privilege checking
-    def _get_client_info():
-        """Return information about the most recent cherrypy request, if any."""
-        if hasattr(request.authorization, 'username'):
-            auth_user = request.authorization.username
-        else:
-            auth_user = 'Unknown'
-        info = request.headers
-        origin_string = info.get("User-Agent", "") 
-        origin_props = {}
-        if origin_string:
-            try:
-                origin_props = dict(
-                    [_.split("/", 1) for _ in origin_string.split()]
-                )
-            except ValueError:
-                pass
-        prog_name = origin_props.get("prog_name", "Unknown")
-        uuid = origin_props.get("uuid", uuid4())
-        host = info.get("Host", "Unknown")
-        if info.get("From") and "@" in info["From"]:
-            user = info["From"].split("@")[0]
-        else:
-            user = ("Unknown")
-        return auth_user, prog_name, user, host, uuid
-    
-    def _access_priv_ok(required_privilege_level):
-        """Return True if a client is allowed access to info from server_obj.
-    
-        The required privilege level is compared to the level granted to the
-        client by the connection validator (held in thread local storage).
-    
-        """
-        try:
-            return _check_access_priv(required_privilege_level)
-        except InvalidUsage:
-            return False
-    
-    def _check_access_priv(required_privilege_level):
-        """Raise an exception if client privilege is insufficient for server_obj.
-    
-        (See the documentation above for the boolean version of this function).
-    
-        """
-        auth_user, prog_name, user, host, uuid = _get_client_info()
-        priv_level = _get_priv_level(auth_user)
-        if (PRIVILEGE_LEVELS.index(priv_level) <
-                PRIVILEGE_LEVELS.index(required_privilege_level)):
-            err = CONNECT_DENIED_PRIV_TMPL % (
-                priv_level, required_privilege_level,
-                user, host, prog_name, uuid)
-            #LOG.warning(err)
-            # Raise an exception to be sent back to the client.
-            raise InvalidUsage(err, status_code=403)
-        return True
-
-    def _check_access_priv_and_report(required_privilege_level, command, log_info=True):
-        """Check access privilege and log requests with identifying info.
-
-        In debug mode log all requests including task messages. Otherwise log
-        all user commands, and just the first info command from each client.
-
-        Return:
-            dict: containing the client session
-
-        """
-        _check_access_priv(required_privilege_level)
-        auth_user, prog_name, user, host, uuid = _get_client_info()
-        priv_level = _get_priv_level(auth_user)
-        #print(LOG_CONNECT_ALLOWED_TMPL % (
-            #user, host, prog_name, priv_level, uuid))
-        if uuid not in clients and log_info:
-            #print(LOG_COMMAND_TMPL % (
-            #    command, user, host, prog_name, uuid))
-            pass
-        clients.setdefault(uuid, {})
-        clients[uuid]['time'] = time()
-        _housekeep()
-        return clients[uuid]
-
-    
-    def _get_priv_level(auth_user):
-        """Get the privilege level for this authenticated user."""
-        if auth_user in user_priv:
-            return user_priv.get(auth_user)
-        return 'identity'
-        #return self.schd.config.cfg['cylc']['authentication']['public']
-
-    def _report_id_requests():
-        """Report the frequency of identification (scan) requests."""
-        _num_id_requests += 1
-        now = time()
-        interval = now - _id_start_time
-        if interval > CLIENT_ID_REPORT_SECONDS:
-            rate = float(_num_id_requests) / interval
-            log = None
-            if rate > CLIENT_ID_MIN_REPORT_RATE:
-                log = "warning"
-            
-            #print(LOG_IDENTIFY_TMPL % ( 
-            #        _num_id_requests, interval ))
-            _id_start_time = now 
-            _num_id_requests = 0 
-        uuid = _get_client_info()[4]
-        clients.setdefault(uuid, {}) 
-        clients[uuid]['time'] = now 
-        _housekeep()
-   
-
-    def _housekeep():
-        """Forget inactive clients."""
-        for uuid, client_info in clients.copy().items():
-            if time() - client_info['time'] > CLIENT_FORGET_SEC:
-                try:
-                    del clients[uuid]
-                except KeyError:
-                    pass
-                print(LOG_FORGET_TMPL % uuid)
-    
-
-    def _literal_eval(key, value, default=None):
-        """Wrap ast.literal_eval if value is basestring.
-
-        On SyntaxError or ValueError, return default is default is not None.
-        Otherwise, raise HTTPError 400.
-        """
-        if isinstance(value, basestring):
-            try:
-                return ast.literal_eval(value)
-            except (SyntaxError, ValueError):
-                if default is not None:
-                    return default
-                raise InvalidUsage(
-                    'Bad argument value: %s=%s' % (key, value),400)
-        else:
-            return value
-
-    def priv_check(privilege, log_info=True):
-        def priv_decorator(func):
-            @wraps(func)
-            def priv_wrapper(*args, **kwargs):
-                command = func.__name__
-                _check_access_priv_and_report(privilege, command, log_info)
-                return func(*args, **kwargs)
-            return priv_wrapper
-        return priv_decorator
-
-
     # ** End point definitions
-    @app.route('/schd_info')
+    @app.route(url_prefix+'/schd_info')
     @auth.login_required
     @priv_check('identity')
     def schd_info():
@@ -487,7 +505,7 @@ def api_compilation(app):
         api_dict['suite'] = suite
         return jsonify(api_dict)
 
-    @app.route('/print_auth')
+    @app.route(url_prefix+'/print_auth')
     @auth.login_required
     @priv_check('identity')
     def print_auth():
@@ -498,7 +516,7 @@ def api_compilation(app):
         client_info = _get_client_info()
         return jsonify(True,'''Hello: {0} {1}'''.format(client_info, headers))
 
-    @app.route('/print_elite', methods=['GET'])
+    @app.route(url_prefix+'/print_elite', methods=['GET'])
     @auth.login_required
     @priv_check(PRIV_FULL_CONTROL, log_info=False)
     def print_auth2():
@@ -518,7 +536,7 @@ def api_compilation(app):
 
 '''.format(client_info, headers, argone, argtwo, argthree)
 
-    @app.route('/postjson', methods = ['GET', 'POST'])
+    @app.route(url_prefix+'/postjson', methods = ['GET', 'POST'])
     def postjson():
         if not request.is_json:
             raise InvalidUsage("Unsupported Content-Type: Must be JSON", status_code=415)
@@ -533,7 +551,7 @@ def api_compilation(app):
 '''.format(greeting, name)
 
 
-    @app.route('/')
+    @app.route(url_prefix+'/')
     @priv_check('identity')
     def index():
         #if 'username' in session:
@@ -541,24 +559,24 @@ def api_compilation(app):
         return 'You are not logged in'
 
 
-    @app.route('/hello/')
-    @app.route('/hello/<name>')
+    @app.route(url_prefix+'/hello/')
+    @app.route(url_prefix+'/hello/<name>')
     def hello(name=None):
         return render_template('hello.html', name=name)
 
-    @app.route("/user/<username>")
+    @app.route(url_prefix+"/user/<username>")
     def show_user_profile(username):
         return 'User %s' % username
 
-    @app.route('/post/<int:post_id>/')
+    @app.route(url_prefix+'/post/<int:post_id>/')
     def show_post(post_id):
         return 'Post %d' % post_id
 
-    @app.route('/inherit/')
+    @app.route(url_prefix+'/inherit/')
     def inherit_template():
         return render_template('child_1.html')
 
-#    @app.route('/login', methods=['POST', 'GET'])
+#    @app.route(url_prefix+'/login', methods=['POST', 'GET'])
 #    def login():
 #        error = None
 #        if request.method == 'POST':
@@ -577,7 +595,7 @@ def api_compilation(app):
             return True
 
 
-#    @app.route('/logout')
+#    @app.route(url_prefix+'/logout')
 #    def logout():
 #        # remove the username from the session if it's there
 #        session.pop('username', None)
@@ -589,7 +607,7 @@ def api_compilation(app):
         return '.' in filename and \
                filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
 
-    @app.route('/upload/', methods=['GET', 'POST'])
+    @app.route(url_prefix+'/upload/', methods=['GET', 'POST'])
     def upload_file():
         error=None
         if request.method == 'POST':
@@ -611,15 +629,15 @@ def api_compilation(app):
         return render_template('upload.html', error=error)
 
 
-    @app.route('/uploaded/')
+    @app.route(url_prefix+'/uploaded/')
     def file_uploaded():
         return 'File uploaded'
 
-    @app.route('/uploads/<filename>')
+    @app.route(url_prefix+'/uploads/<filename>')
     def uploaded_file(filename):
         return send_from_directory(app.config['UPLOAD_FOLDER'], filename)
 
-    @app.route('/scheduler')
+    @app.route(url_prefix+'/scheduler')
     def print_scheduler():
         return schd
 
