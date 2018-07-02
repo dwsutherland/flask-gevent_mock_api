@@ -3,7 +3,7 @@
 import os
 import sys
 
-AUTHENTICATION_TYPE = 'Basic'
+AUTHENTICATION_METHOD = 'Basic'
 
 def environ_path_add(dirs, key='PATH'):
     """For each dir_ in dirs, prepend dir_ to the PATH environment variable.

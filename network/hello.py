@@ -13,11 +13,11 @@ from functools import wraps
 from hashlib import md5, sha1
 from time import time
 
-from flask import Flask, session, g, url_for, render_template, Markup, request, redirect, send_from_directory, escape, jsonify
+from flask import Flask, Blueprint, session, g, url_for, render_template, Markup, request, redirect, send_from_directory, escape, jsonify
 #from flask_session import Session
 
 from network import (
-    user_priv, AUTHENTICATION_TYPE, CLIENT_FORGET_SEC, CLIENT_ID_MIN_REPORT_RATE,
+    user_priv, AUTHENTICATION_METHOD, CLIENT_FORGET_SEC, CLIENT_ID_MIN_REPORT_RATE,
     CLIENT_ID_REPORT_SECONDS, LOG_COMMAND_TMPL, LOG_IDENTIFY_TMPL,
     LOG_FORGET_TMPL, LOG_CONNECT_ALLOWED_TMPL, NO_PASSPHRASE,
     PRIVILEGE_LEVELS, PRIV_IDENTITY, PRIV_DESCRIPTION, PRIV_STATE_TOTALS,
@@ -28,10 +28,10 @@ from werkzeug.utils import secure_filename
 
 comms_options = 'md5'
 
-if AUTHENTICATION_TYPE == 'Basic':
+if AUTHENTICATION_METHOD == 'Basic':
     from flask_httpauth import HTTPBasicAuth
     auth = HTTPBasicAuth()
-elif AUTHENTICATION_TYPE == 'Digest':
+elif AUTHENTICATION_METHOD == 'Digest':
     from flask_httpauth import HTTPDigestAuth
     auth = HTTPDigestAuth(use_ha1_pw=True)
 
@@ -51,7 +51,6 @@ class InvalidUsage(Exception):
         rv = dict(self.payload or ()) 
         rv['message'] = self.message
         return rv
-
 
 
 def mkdir_p(path, mode=None):
@@ -164,23 +163,24 @@ def create_app(schd_obj):
     app = Flask(__name__)
 
     #app.config['SESSION_TYPE'] = 'null'
-    app.config['ENV'] = 'production'
-    app.config['DEBUG'] = False
-    app.config['SCHEDULER'] = schd_obj
-    app.config['UPLOAD_FOLDER'] = '/home/sutherlanddw/projects/learn_flask/helloworld/uploads'
-    app.config['SECRET_KEY'] = binascii.hexlify(os.urandom(16))
-    app.config['JSONIFY_PRETTYPRINT_REGULAR'] = False
+    app.config.update(
+        ENV = 'production',
+        DEBUG = False,
+        SECRET_KEY = binascii.hexlify(os.urandom(16)),
+        UPLOAD_FOLDER = os.path.join(os.path.realpath(__file__),'uploads'),
+        JSON_PRETTYPRINT_REGULAR = False,
+        SCHEDULER = schd_obj
+        )
     
     ALLOWED_EXTENSIONS = set(['txt', 'pdf', 'png', 'jpg', 'jpeg', 'gif', 'gz'])
-    srv_d = '/home/sutherlanddw/projects/learn_flask/cylctest'
-
+    srv_d = os.path.dirname(os.path.dirname(__file__))
 
     def _set_users():
         users = { 
                 'cortex': 'lemon',
                 'anon': NO_PASSPHRASE
             }   
-        if AUTHENTICATION_TYPE == 'Basic':
+        if AUTHENTICATION_METHOD == 'Basic':
             for username in users:
                 if "SHA1" in comms_options:
                     # Note 'SHA1' not 'SHA'.
@@ -189,10 +189,9 @@ def create_app(schd_obj):
                     users[username] = md5(users.get(username)).hexdigest()
         return users
     
-    
     users = _set_users()
     
-    if AUTHENTICATION_TYPE == 'Basic':
+    if AUTHENTICATION_METHOD == 'Basic':
         @auth.get_password
         def get_pw(username):
             if username in users:
@@ -208,7 +207,7 @@ def create_app(schd_obj):
             else:
                 return md5(password).hexdigest()
 
-    elif AUTHENTICATION_TYPE == 'Digest':
+    elif AUTHENTICATION_METHOD == 'Digest':
         @auth.get_password
         def get_pw(username):
             if username in users:
@@ -227,12 +226,11 @@ def create_app(schd_obj):
         response.status_code = error.status_code
         return response
 
-    api_endpoints(app)
-    for vfunc in app.view_functions:
-        app.add_url_rule('/id/'+vfunc, vfunc, app.view_functions[vfunc])
+    api = api_blueprint(app)
+    app.register_blueprint(api)
+    app.register_blueprint(api, url_prefix='/id')
 
     test_endpoints(app)
-    #api_endpoints(app,url_prefix='/id')
 
     @app.after_request
     def after_request(response):
@@ -483,19 +481,15 @@ def test_endpoints(app):
         return "Hello!"
 
 
-def api_endpoints(app, url_prefix=None):
+def api_blueprint(app):
     
-    if url_prefix is None or url_prefix == '/':
-        url_prefix = ''
-    elif isinstance(url_prefix, basestring):
-        if url_prefix[0] != '/':
-            url_prefix = '/' + url_prefix
+    api_blu = Blueprint('api',__name__)
 
     schd = app.config['SCHEDULER']
     suite = schd.suite
 
     # ** End point definitions
-    @app.route(url_prefix+'/schd_info')
+    @api_blu.route('/schd_info')
     @auth.login_required
     @priv_check('identity')
     def schd_info():
@@ -505,7 +499,7 @@ def api_endpoints(app, url_prefix=None):
         api_dict['suite'] = suite
         return jsonify(api_dict)
 
-    @app.route(url_prefix+'/print_auth')
+    @api_blu.route('/print_auth')
     @auth.login_required
     @priv_check('identity')
     def print_auth():
@@ -516,7 +510,7 @@ def api_endpoints(app, url_prefix=None):
         client_info = _get_client_info()
         return jsonify(True,'''Hello: {0} {1}'''.format(client_info, headers))
 
-    @app.route(url_prefix+'/print_elite', methods=['GET'])
+    @api_blu.route('/print_elite', methods=['GET'])
     @auth.login_required
     @priv_check(PRIV_FULL_CONTROL, log_info=False)
     def print_auth2():
@@ -536,7 +530,7 @@ def api_endpoints(app, url_prefix=None):
 
 '''.format(client_info, headers, argone, argtwo, argthree)
 
-    @app.route(url_prefix+'/postjson', methods = ['GET', 'POST'])
+    @api_blu.route('/postjson', methods = ['GET', 'POST'])
     def postjson():
         if not request.is_json:
             raise InvalidUsage("Unsupported Content-Type: Must be JSON", status_code=415)
@@ -551,7 +545,7 @@ def api_endpoints(app, url_prefix=None):
 '''.format(greeting, name)
 
 
-    @app.route(url_prefix+'/')
+    @api_blu.route('/')
     @priv_check('identity')
     def index():
         #if 'username' in session:
@@ -559,24 +553,24 @@ def api_endpoints(app, url_prefix=None):
         return 'You are not logged in'
 
 
-    @app.route(url_prefix+'/hello/')
-    @app.route(url_prefix+'/hello/<name>')
+    @api_blu.route('/hello/')
+    @api_blu.route('/hello/<name>')
     def hello(name=None):
         return render_template('hello.html', name=name)
 
-    @app.route(url_prefix+"/user/<username>")
+    @api_blu.route("/user/<username>")
     def show_user_profile(username):
         return 'User %s' % username
 
-    @app.route(url_prefix+'/post/<int:post_id>/')
+    @api_blu.route('/post/<int:post_id>/')
     def show_post(post_id):
         return 'Post %d' % post_id
 
-    @app.route(url_prefix+'/inherit/')
+    @api_blu.route('/inherit/')
     def inherit_template():
         return render_template('child_1.html')
 
-#    @app.route(url_prefix+'/login', methods=['POST', 'GET'])
+#    @api_blu.route('/login', methods=['POST', 'GET'])
 #    def login():
 #        error = None
 #        if request.method == 'POST':
@@ -595,7 +589,7 @@ def api_endpoints(app, url_prefix=None):
             return True
 
 
-#    @app.route(url_prefix+'/logout')
+#    @api_blu.route('/logout')
 #    def logout():
 #        # remove the username from the session if it's there
 #        session.pop('username', None)
@@ -607,7 +601,7 @@ def api_endpoints(app, url_prefix=None):
         return '.' in filename and \
                filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
 
-    @app.route(url_prefix+'/upload/', methods=['GET', 'POST'])
+    @api_blu.route('/upload/', methods=['GET', 'POST'])
     def upload_file():
         error=None
         if request.method == 'POST':
@@ -629,24 +623,19 @@ def api_endpoints(app, url_prefix=None):
         return render_template('upload.html', error=error)
 
 
-    @app.route(url_prefix+'/uploaded/')
+    @api_blu.route('/uploaded/')
     def file_uploaded():
         return 'File uploaded'
 
-    @app.route(url_prefix+'/uploads/<filename>')
+    @api_blu.route('/uploads/<filename>')
     def uploaded_file(filename):
         return send_from_directory(app.config['UPLOAD_FOLDER'], filename)
 
-    @app.route(url_prefix+'/scheduler')
+    @api_blu.route('/scheduler')
     def print_scheduler():
         return schd
 
-    with app.test_request_context():
-        print url_for('index')
-        print url_for('hello', name='Andre the Giant')
-        print url_for('show_user_profile', username='Bob Marley')
-        print url_for('show_post', post_id=1224 )
-
+    return api_blu
 
 
 
