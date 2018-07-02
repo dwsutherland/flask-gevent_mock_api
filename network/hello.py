@@ -35,8 +35,6 @@ elif AUTHENTICATION_METHOD == 'Digest':
     from flask_httpauth import HTTPDigestAuth
     auth = HTTPDigestAuth(use_ha1_pw=True)
 
-app_server = None
-
 class InvalidUsage(Exception):
     status_code = 400 
 
@@ -164,12 +162,12 @@ def create_app(schd_obj):
 
     #app.config['SESSION_TYPE'] = 'null'
     app.config.update(
-        ENV = 'production',
-        DEBUG = False,
+        DEBUG = True,
         SECRET_KEY = binascii.hexlify(os.urandom(16)),
         UPLOAD_FOLDER = os.path.join(os.path.realpath(__file__),'uploads'),
         JSON_PRETTYPRINT_REGULAR = False,
-        SCHEDULER = schd_obj
+        CYLC_SCHEDULER = schd_obj,
+        CYLC_API = 3
         )
     
     ALLOWED_EXTENSIONS = set(['txt', 'pdf', 'png', 'jpg', 'jpeg', 'gif', 'gz'])
@@ -284,7 +282,6 @@ def start_app(app):
             flask_options['port'] = port
             try:
                 #app.run(**flask_options)
-                global app_server
                 if comms_method == 'http':
                     app_server = pywsgi.WSGIServer((host, port), app)
                     srv_start_msg = "Server started: http://%s:%s"
@@ -296,22 +293,194 @@ def start_app(app):
 
                 app_server.start()
                 print srv_start_msg % (host,port)
-                break
+                return app_server
             except socket.error:
                 print "Unable to start api on port %s" % port
         
         if port == ok_ports[-1]:
             raise Exception("No available ports")
 
-def shutdown_server():
+
+def shutdown_server(app_server):
     """Shutdown the web server."""
     if hasattr(app_server, "stop"):
         app_server.stop()
 
-def get_port():
+def get_port(app_server):
     """Return the web server port."""
     if hasattr(app_server, "server_port"):
         return app_server.server_port
+
+
+def test_endpoints(app):
+    @app.route('/test_func')
+    def new_function():
+        return "Hello!"
+
+
+def api_blueprint(app):
+    
+    api_blu = Blueprint('api',__name__)
+
+    schd = app.config['CYLC_SCHEDULER']
+    suite = schd.suite
+
+    # ** End point definitions
+
+    @api_blu.route('/apiversion', methods = ['GET'])
+    def apiversion():
+        """Return API version."""
+        return str(app.config['CYLC_API'])
+
+
+    @api_blu.route('/schd_info')
+    @auth.login_required
+    @priv_check('identity')
+    def schd_info():
+        #print(suite)
+        #auth_user = request.authorization.username
+        api_dict = schd.about_api()
+        api_dict['suite'] = suite
+        return jsonify(api_dict)
+
+    @api_blu.route('/print_auth')
+    @auth.login_required
+    @priv_check('identity')
+    def print_auth():
+        #auth_user = request.authorization.username
+        headers = request.headers
+        enviro = request.environ
+        autho_type = headers['Authorization']
+        client_info = _get_client_info()
+        return jsonify(True,'''Hello: {0} {1}'''.format(client_info, headers))
+
+    @api_blu.route('/print_elite', methods=['GET'])
+    @auth.login_required
+    @priv_check(PRIV_FULL_CONTROL, log_info=False)
+    def print_auth2():
+        #auth_user = request.authorization.username
+        argone = request.args.get('argone')
+        argtwo = request.args.get('argtwo')
+        argthree = request.args.get('argthree')
+        headers = request.headers
+        enviro = request.environ
+        autho_type = headers['Authorization']
+        client_info = _get_client_info()
+        return '''Hello: {0} {1}
+
+{2}
+{3}
+{4}
+
+'''.format(client_info, headers, argone, argtwo, argthree)
+
+    @api_blu.route('/postjson', methods = ['GET', 'POST'])
+    def postjson():
+        if not request.is_json:
+            raise InvalidUsage("Unsupported Content-Type: Must be JSON", status_code=415)
+        check_syntax = True
+        check_syntax = _literal_eval('check_syntax', check_syntax)
+        print(check_syntax)
+        req_data = request.get_json()
+        greeting = req_data.get('greeting')
+        name = req_data.get('name')
+        return '''
+{0} {1}
+'''.format(greeting, name)
+
+
+    @api_blu.route('/')
+    @priv_check('identity')
+    def index():
+        #if 'username' in session:
+        #    return 'Logged in as %s' % escape(session['username'])
+        return 'You are not logged in'
+
+
+    @api_blu.route('/hello/')
+    @api_blu.route('/hello/<name>')
+    def hello(name=None):
+        return render_template('hello.html', name=name)
+
+    @api_blu.route("/user/<username>")
+    def show_user_profile(username):
+        return 'User %s' % username
+
+    @api_blu.route('/post/<int:post_id>/')
+    def show_post(post_id):
+        return 'Post %d' % post_id
+
+    @api_blu.route('/inherit/')
+    def inherit_template():
+        return render_template('child_1.html')
+
+#    @api_blu.route('/login', methods=['POST', 'GET'])
+#    def login():
+#        error = None
+#        if request.method == 'POST':
+#            if valid_login(request.form['username'],
+#                           request.form['password']):
+#                session['username'] = request.form['username']
+#                return redirect(url_for('index'))
+#            else:
+#                error = 'Invalid username/password'
+#        # the code below is executed if the request method
+#        # was GET or the credentials were invalid
+#        return render_template('login.html', error=error)
+
+    def valid_login(username,password):
+        if username in users and password == users.get(username):
+            return True
+
+
+#    @api_blu.route('/logout')
+#    def logout():
+#        # remove the username from the session if it's there
+#        session.pop('username', None)
+#        return redirect(url_for('index'))
+
+
+
+    def allowed_file(filename):
+        return '.' in filename and \
+               filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
+
+    @api_blu.route('/upload/', methods=['GET', 'POST'])
+    def upload_file():
+        error=None
+        if request.method == 'POST':
+            # check if the post request has the file part
+            if 'file' not in request.files:
+                flash('No file part')
+                return redirect(request.url)
+            file = request.files['file']
+            # if user does not select file, browser also
+            # submit a empty part without filename
+            if file.filename == '':
+                flash('No selected file')
+                return redirect(request.url)
+            if file and allowed_file(file.filename):
+                filename = secure_filename(file.filename)
+                file.save(os.path.join(app.config['UPLOAD_FOLDER'], filename))
+                return redirect(url_for('file_uploaded',
+                                        filename=filename))
+        return render_template('upload.html', error=error)
+
+
+    @api_blu.route('/uploaded/')
+    def file_uploaded():
+        return 'File uploaded'
+
+    @api_blu.route('/uploads/<filename>')
+    def uploaded_file(filename):
+        return send_from_directory(app.config['UPLOAD_FOLDER'], filename)
+
+    @api_blu.route('/scheduler')
+    def print_scheduler():
+        return schd
+
+    return api_blu
+
 
 # ** Client info and privilege checking
 def _get_client_info():
@@ -473,169 +642,6 @@ def priv_check(privilege, log_info=True):
             return func(*args, **kwargs)
         return priv_wrapper
     return priv_decorator
-
-
-def test_endpoints(app):
-    @app.route('/test_func')
-    def new_function():
-        return "Hello!"
-
-
-def api_blueprint(app):
-    
-    api_blu = Blueprint('api',__name__)
-
-    schd = app.config['SCHEDULER']
-    suite = schd.suite
-
-    # ** End point definitions
-    @api_blu.route('/schd_info')
-    @auth.login_required
-    @priv_check('identity')
-    def schd_info():
-        #print(suite)
-        #auth_user = request.authorization.username
-        api_dict = schd.about_api()
-        api_dict['suite'] = suite
-        return jsonify(api_dict)
-
-    @api_blu.route('/print_auth')
-    @auth.login_required
-    @priv_check('identity')
-    def print_auth():
-        #auth_user = request.authorization.username
-        headers = request.headers
-        enviro = request.environ
-        autho_type = headers['Authorization']
-        client_info = _get_client_info()
-        return jsonify(True,'''Hello: {0} {1}'''.format(client_info, headers))
-
-    @api_blu.route('/print_elite', methods=['GET'])
-    @auth.login_required
-    @priv_check(PRIV_FULL_CONTROL, log_info=False)
-    def print_auth2():
-        #auth_user = request.authorization.username
-        argone = request.args.get('argone')
-        argtwo = request.args.get('argtwo')
-        argthree = request.args.get('argthree')
-        headers = request.headers
-        enviro = request.environ
-        autho_type = headers['Authorization']
-        client_info = _get_client_info()
-        return '''Hello: {0} {1}
-
-{2}
-{3}
-{4}
-
-'''.format(client_info, headers, argone, argtwo, argthree)
-
-    @api_blu.route('/postjson', methods = ['GET', 'POST'])
-    def postjson():
-        if not request.is_json:
-            raise InvalidUsage("Unsupported Content-Type: Must be JSON", status_code=415)
-        check_syntax = True
-        check_syntax = _literal_eval('check_syntax', check_syntax)
-        print(check_syntax)
-        req_data = request.get_json()
-        greeting = req_data.get('greeting')
-        name = req_data.get('name')
-        return '''
-{0} {1}
-'''.format(greeting, name)
-
-
-    @api_blu.route('/')
-    @priv_check('identity')
-    def index():
-        #if 'username' in session:
-        #    return 'Logged in as %s' % escape(session['username'])
-        return 'You are not logged in'
-
-
-    @api_blu.route('/hello/')
-    @api_blu.route('/hello/<name>')
-    def hello(name=None):
-        return render_template('hello.html', name=name)
-
-    @api_blu.route("/user/<username>")
-    def show_user_profile(username):
-        return 'User %s' % username
-
-    @api_blu.route('/post/<int:post_id>/')
-    def show_post(post_id):
-        return 'Post %d' % post_id
-
-    @api_blu.route('/inherit/')
-    def inherit_template():
-        return render_template('child_1.html')
-
-#    @api_blu.route('/login', methods=['POST', 'GET'])
-#    def login():
-#        error = None
-#        if request.method == 'POST':
-#            if valid_login(request.form['username'],
-#                           request.form['password']):
-#                session['username'] = request.form['username']
-#                return redirect(url_for('index'))
-#            else:
-#                error = 'Invalid username/password'
-#        # the code below is executed if the request method
-#        # was GET or the credentials were invalid
-#        return render_template('login.html', error=error)
-
-    def valid_login(username,password):
-        if username in users and password == users.get(username):
-            return True
-
-
-#    @api_blu.route('/logout')
-#    def logout():
-#        # remove the username from the session if it's there
-#        session.pop('username', None)
-#        return redirect(url_for('index'))
-
-
-
-    def allowed_file(filename):
-        return '.' in filename and \
-               filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
-
-    @api_blu.route('/upload/', methods=['GET', 'POST'])
-    def upload_file():
-        error=None
-        if request.method == 'POST':
-            # check if the post request has the file part
-            if 'file' not in request.files:
-                flash('No file part')
-                return redirect(request.url)
-            file = request.files['file']
-            # if user does not select file, browser also
-            # submit a empty part without filename
-            if file.filename == '':
-                flash('No selected file')
-                return redirect(request.url)
-            if file and allowed_file(file.filename):
-                filename = secure_filename(file.filename)
-                file.save(os.path.join(app.config['UPLOAD_FOLDER'], filename))
-                return redirect(url_for('file_uploaded',
-                                        filename=filename))
-        return render_template('upload.html', error=error)
-
-
-    @api_blu.route('/uploaded/')
-    def file_uploaded():
-        return 'File uploaded'
-
-    @api_blu.route('/uploads/<filename>')
-    def uploaded_file(filename):
-        return send_from_directory(app.config['UPLOAD_FOLDER'], filename)
-
-    @api_blu.route('/scheduler')
-    def print_scheduler():
-        return schd
-
-    return api_blu
 
 
 

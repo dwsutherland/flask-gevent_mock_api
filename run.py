@@ -19,12 +19,12 @@ this_schd = Scheduler()
 
 if __name__ == '__main__':
     flask_app = hello.create_app(this_schd)
-    hello.start_app(flask_app)
+    http_server = hello.start_app(flask_app)
     #thread.start_new_thread(hello.start_app(flask_app),())
     print('I got past the start!')
     time.sleep(40)
-    hello.shutdown_server()
-    print "Server on port %s stopped!" % hello.get_port()
+    hello.shutdown_server(http_server)
+    print "Server on port %s stopped!" % hello.get_port(http_server)
     time.sleep(10)
     print("finished!")
 
